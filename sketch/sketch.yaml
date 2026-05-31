@@ -1,9 +1,0 @@
-profiles:
-  default:
-    fqbn: arduino:zephyr:unoq
-    platforms:
-      - platform: arduino:zephyr
-    libraries:
-      - RadioLib (7.7.0)
-
-default_profile: default

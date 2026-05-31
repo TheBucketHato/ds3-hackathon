@@ -5,5 +5,7 @@ profiles:
       - platform: arduino:zephyr
     libraries:
       - RadioLib (7.7.0)
+      # AES-GCM is vendored in sketch/src/ (rweather Crypto, minus its RNG.cpp
+      # which clashes with the STM32 'RNG' macro) — no external crypto lib.
 
 default_profile: default

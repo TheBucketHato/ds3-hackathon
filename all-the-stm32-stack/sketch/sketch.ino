@@ -30,6 +30,7 @@
 #include <RadioLib.h>
 #include "motor.h"
 #include "imu.h"
+#include "lora_crypto.h"   // AES-256-GCM on the LoRa payload
 
 // ---- LoRa pin map / config -------------------------------------------------
 // D8 is the Elegoo LEFT-motor direction pin, so LoRa DIO0/INT is moved to A0.
@@ -79,7 +80,7 @@ static float    visPrevX = 0, visPrevY = 0;
 static uint32_t lastImuUs = 0;
 static uint32_t stepCount = 0;
 
-#define MAX_WP 24
+#define MAX_WP 48          // long paths arrive chunked across P + A packets
 static float wpx[MAX_WP], wpy[MAX_WP];
 static uint8_t wpCount = 0, wpIndex = 0;
 
@@ -204,17 +205,25 @@ static void updateHeading() {
 // ---- radio TX/RX ------------------------------------------------------------
 static void sendLine(const char *line) {
   size_t mlen = strlen(line);
-  uint8_t out[HDR_LEN + 240];
+  if (mlen > 200) mlen = 200;                 // leave room for header+nonce+tag
+  uint8_t out[HDR_LEN + 200 + LORA_OVERHEAD];
   out[0] = HDR_TO; out[1] = HDR_FROM; out[2] = HDR_ID; out[3] = HDR_FLAGS;
-  if (mlen > 240) mlen = 240;
-  memcpy(out + HDR_LEN, line, mlen);
-  int state = radio.transmit(out, HDR_LEN + mlen);
+  size_t blob = loraEncrypt((const uint8_t *)line, mlen, out + HDR_LEN);
+  int state = radio.transmit(out, HDR_LEN + blob);
   radio.setCRC(true);
   radio.startReceive();
   Serial.print("[TX] "); Serial.println(line);
   if (state != RADIOLIB_ERR_NONE) {
     Serial.print("  (tx err "); Serial.print(state); Serial.println(")");
   }
+}
+
+// RouterBridge RPC the Debian/webcam side calls to relay station-bound telemetry
+// it produces — bounding boxes "B x y w ..." and info points "I type x y". The
+// MCU just encrypts + transmits it over LoRa. Chunk B to <=8 boxes per call so
+// each stays within one packet (~223 B plaintext). The MCU sends R pose itself.
+static void onLoraTx(String msg) {
+  sendLine(msg.c_str());
 }
 
 static void sendPose() {
@@ -227,11 +236,13 @@ static void sendPose() {
   sendLine(line);
 }
 
+// 'P' starts a NEW path (clears existing); 'A' appends to it. Long paths that
+// don't fit one LoRa packet (~12 waypoints) are sent as P then one or more A.
 static void handleCommand(char *line) {
   Serial.print("[RX] "); Serial.println(line);
   if (line[0] == 'S') { wpCount = wpIndex = 0; motorStop(); vLastCmd = 0; return; }
-  if (line[0] == 'P') {
-    wpCount = wpIndex = 0;
+  if (line[0] == 'P' || line[0] == 'A') {
+    if (line[0] == 'P') { wpCount = wpIndex = 0; }   // new path vs. append chunk
     char *tok = strtok(line + 1, " ");
     while (tok != NULL) {
       float x = atof(tok);
@@ -250,13 +261,17 @@ static void pollRadio() {
   uint8_t buf[256];
   int state = radio.readData(buf, sizeof(buf));
   int n = radio.getPacketLength();
-  if (state == RADIOLIB_ERR_NONE && n > HDR_LEN) {
-    int payload = n - HDR_LEN;
-    if (payload > 250) payload = 250;
-    char line[251];
-    memcpy(line, buf + HDR_LEN, payload);
-    line[payload] = '\0';
-    handleCommand(line);
+  if (state == RADIOLIB_ERR_NONE && n > (int)(HDR_LEN + LORA_OVERHEAD)) {
+    uint8_t plain[251];
+    int plen = loraDecrypt(buf + HDR_LEN, n - HDR_LEN, plain);
+    if (plen > 0 && plen < 250) {
+      char line[251];
+      memcpy(line, plain, plen);
+      line[plen] = '\0';
+      handleCommand(line);
+    } else {
+      Serial.println("[RX] dropped (auth/decrypt fail)");
+    }
   }
   radio.startReceive();
 }
@@ -271,6 +286,8 @@ void setup() {
   Bridge.begin();
   Monitor.begin(115200);
   Bridge.provide("vision_pose", onVisionRPC);   // Debian webcam pose feed
+  Bridge.provide("lora_tx", onLoraTx);          // Debian relays boxes/info -> LoRa
+  loraCryptoBegin();                            // AES-256-GCM link encryption
   unsigned long t0 = millis();
   while (millis() - t0 < 8000) { blink(1, 100, 100); }   // let a monitor attach
 
