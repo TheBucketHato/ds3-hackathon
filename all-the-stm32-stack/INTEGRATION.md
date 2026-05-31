@@ -49,6 +49,34 @@ vision pose streamed from the board's Debian/Linux side.
   bench mode, follow paths on dead-reckoning alone (drifts; for motor/IMU
   bring-up without the Debian side).
 
+## NEW BOARD / NEW ROBOT - what must be redone
+
+PORTABLE (no change if same Elegoo V4.0 kit):
+- Motor pin map (`motor.cpp`): PWMA=5 AIN1=7 PWMB=6 BIN1=8 STBY=3, one dir pin
+  per channel, A=right/B=left, DIR HIGH=forward.
+- IMU driver: auto-detects chip+bus, nothing to set.
+
+MUST RE-VERIFY / RE-CALIBRATE per physical robot - use the **`lora-calib`** app
+(separate sibling app, interactive menu over `arduino-app-cli monitor`):
+- `V_MAX_MPS` (motor.cpp) + `MAX_V` (sketch.ino) - calib `v`.
+- `MIN_MOVE_PWM_L` / `_R` (motor.cpp) stiction - calib `s`.
+- `WHEELBASE` (sketch.ino) effective skid-steer track - calib `w` (= 2*V_MAX/spin_rate).
+- `IMU_YAW_SIGN` (imu.cpp) - calib `i` (must read + for a left/CCW turn).
+- Current values are for ONE specific robot (2026-05-31): V_MAX 0.98, stiction
+  L30/R28, wheelbase 0.40, yaw sign -1.
+
+## HARDWARE GOTCHA - LoRa vs Elegoo pin conflict (must resolve)
+
+The Elegoo shield and the RFM9x LoRa default pins collide. Motors are fixed, so
+the LoRa side moves:
+- LoRa SPI (SCK13/MISO12/MOSI11) + CS10 collide with the Elegoo **ultrasonic +
+  camera servos**  physically **unplug the ultrasonic/servo head** (vision
+  replaces it) to free D10-D13.
+- LoRa INT was moved **D8  A0** (D8 is the left-motor dir pin); rewire the
+  RFM9x DIO0 wire to A0.
+- RST=D2 vs the Elegoo Key button = harmless.
+- IMU: LSM6DS3 on QWIIC works as-is.
+
 ## Build / flash
 
 ```

@@ -5,6 +5,8 @@ profiles:
       - platform: arduino:zephyr
     libraries:
       - RadioLib (7.7.0)
+      - Adafruit MLX90640 (1.1.1)          # flame detection (patched: Zephyr i2c read)
+      - dependency: Adafruit BusIO (1.17.4)
       # AES-GCM is vendored in sketch/src/ (rweather Crypto, minus its RNG.cpp
       # which clashes with the STM32 'RNG' macro) — no external crypto lib.
 

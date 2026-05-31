@@ -30,6 +30,7 @@
 #include <RadioLib.h>
 #include "motor.h"
 #include "imu.h"
+#include "thermal.h"       // MLX90640 flame detection
 #include "lora_crypto.h"   // AES-256-GCM on the LoRa payload
 
 // ---- LoRa pin map / config -------------------------------------------------
@@ -63,8 +64,10 @@ static const float MIN_DISP    = 0.08f;  // m of travel needed to trust a course
 static const float BOOTSTRAP_V = 0.5f * MAX_V;   // slow straight probe to lock heading
 
 // Bench mode: skip the vision gate so the car follows paths off dead-reckoning
-// alone (open loop, drifts). Set to 1 ONLY for motor/IMU bring-up without Debian.
-#define REQUIRE_VISION 1
+// alone (open loop, drifts). Set REQUIRE_VISION 0 to drive LoRa waypoints
+// without the Debian vision side (start pose = origin, facing +x at boot).
+// NOTE: set to 0 now for LoRa-waypoint bench testing; return to 1 for vision.
+#define REQUIRE_VISION 0
 
 // ---- fused robot state (SLAM frame) ----------------------------------------
 static float rx = 0.0f, ry = 0.0f, rtheta = 0.0f;
@@ -83,6 +86,12 @@ static uint32_t stepCount = 0;
 #define MAX_WP 48          // long paths arrive chunked across P + A packets
 static float wpx[MAX_WP], wpy[MAX_WP];
 static uint8_t wpCount = 0, wpIndex = 0;
+
+// Flee-from-flame state: wpDir +1 follows the path forward, -1 walks it back
+// toward the start. Latched once a flame is seen; cleared by a new P/S command.
+static int   wpDir = 1;
+static bool  fleeing = false;
+static float flameX = 0, flameY = 0;   // captured flame location (for reporting)
 
 // ---- RX interrupt flag ------------------------------------------------------
 volatile bool rxFlag = false;
@@ -139,12 +148,18 @@ static void motorCommand(float v, float w) {
   vLastCmd = v;
 }
 
-// Pure-pursuit toward the current waypoint. Outputs (v,w); false = path done.
+// Pure-pursuit toward the current waypoint. wpDir picks forward (+1) or fleeing
+// (-1, walk the list back to the start). Outputs (v,w); false = path done.
 static bool followStep(float *vOut, float *wOut) {
-  if (wpIndex >= wpCount) return false;
+  if (wpCount == 0) return false;
+  if (wpDir > 0 && wpIndex >= wpCount) return false;   // finished forward
   float dx = wpx[wpIndex] - rx, dy = wpy[wpIndex] - ry;
   float dist = sqrt(dx * dx + dy * dy);
-  if (dist < 0.25f) { wpIndex++; *vOut = 0; *wOut = 0; return true; }
+  if (dist < 0.25f) {                                  // reached this waypoint
+    if (wpDir < 0) { if (wpIndex == 0) return false; wpIndex--; }  // back at start
+    else wpIndex++;
+    *vOut = 0; *wOut = 0; return true;
+  }
   float err = angWrap(atan2(dy, dx) - rtheta);
   float wCmd = 3.0f * err;
   float vCmd;
@@ -238,11 +253,50 @@ static void sendPose() {
 
 // 'P' starts a NEW path (clears existing); 'A' appends to it. Long paths that
 // don't fit one LoRa packet (~12 waypoints) are sent as P then one or more A.
+// Flame info point for the GUI: "I 4 x y", type 4 = flame, at the given point.
+static void sendFlame(float fx, float fy) {
+  char line[40]; char *p = line;
+  p += sprintf(p, "I 4");
+  p = appendFloat(p, fx, 3);
+  p = appendFloat(p, fy, 3);
+  *p = '\0';
+  sendLine(line);
+}
+
+// Throttled flame check (getFrame blocks ~150 ms, so ~1 Hz). On a new flame:
+// capture its location 0.5 m ahead, flip to fleeing (reverse down the path),
+// and report it; re-report a couple times while still visible for reliability.
+static void pollFlame() {
+  static uint32_t lastCheck = 0, lastReport = 0;
+  uint32_t now = millis();
+  if (now - lastCheck < 1000) return;
+  lastCheck = now;
+  if (!thermalFlameDetected()) return;
+  if (!fleeing) {                          // rising edge: scared -> retreat
+    fleeing = true;
+    wpDir = -1;
+    if (wpIndex > 0) wpIndex--;            // aim at the waypoint behind us
+    flameX = rx + 0.5f * cos(rtheta);      // flame ~0.5 m ahead of the robot
+    flameY = ry + 0.5f * sin(rtheta);
+    sendFlame(flameX, flameY);
+    lastReport = now;
+    Serial.println("[FLAME] retreating down path");
+  } else if (now - lastReport > 2000) {    // re-send captured location
+    sendFlame(flameX, flameY);
+    lastReport = now;
+  }
+}
+
 static void handleCommand(char *line) {
   Serial.print("[RX] "); Serial.println(line);
-  if (line[0] == 'S') { wpCount = wpIndex = 0; motorStop(); vLastCmd = 0; return; }
+  if (line[0] == 'S') {
+    wpCount = wpIndex = 0; wpDir = 1; fleeing = false; motorStop(); vLastCmd = 0;
+    return;
+  }
   if (line[0] == 'P' || line[0] == 'A') {
-    if (line[0] == 'P') { wpCount = wpIndex = 0; }   // new path vs. append chunk
+    if (line[0] == 'P') {                 // new path: clear + cancel any flee
+      wpCount = wpIndex = 0; wpDir = 1; fleeing = false;
+    }
     char *tok = strtok(line + 1, " ");
     while (tok != NULL) {
       float x = atof(tok);
@@ -302,6 +356,11 @@ void setup() {
   }
   lastImuUs = micros();
 
+  if (!thermalBegin())
+    Serial.println("WARN: MLX90640 not found — flame detection disabled");
+  else
+    Serial.println("Thermal (MLX90640) ok — flame -> flee + report");
+
   int state = radio.begin(RF95_FREQ, 125.0, 7, 5, 0x12, TX_POWER, 8);
   if (state != RADIOLIB_ERR_NONE) die("radio.begin() failed", state);
   radio.setCRC(true);
@@ -318,6 +377,7 @@ void loop() {
   pollRadio();        // inbound P/S
   Bridge.update();    // service inbound vision_pose RPC
   updateHeading();    // integrate gyro as fast as possible
+  pollFlame();        // ~1 Hz flame check -> flee + report (blocks ~150 ms)
 
   uint32_t now = millis();
   if (now - lastTick < (uint32_t)(TICK_S * 1000)) return;
