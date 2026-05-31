@@ -1,26 +1,25 @@
 /*
  * RFM9x LoRa link test for Arduino UNO Q  — RadioLib port
  *
- * Why RadioLib instead of RadioHead: RadioHead's RH_ASK.cpp writes AVR-only
- * timer registers (TCCR1A/TIMSK/ISR) that don't exist on the Arduino Zephyr
- * core, so the library won't compile here. RadioLib targets this SPI API.
+ * Serial note (UNO Q): `Serial` is the Arduino_RouterBridge "Monitor" — an RPC
+ * link to the Linux side, NOT a UART. Output is dropped unless the bridge is up
+ * and a monitor client is attached, so we start the bridge explicitly and, on
+ * any radio failure, print the error FOREVER (not once) so a monitor opened
+ * late still sees it. The built-in LED also blinks as a hardware heartbeat.
  *
- * Flash one board as the SENDER and one as the RECEIVER by toggling
- * NODE_ROLE below. Open Serial Monitor at 115200 on each.
- *
- * On-air format is RadioHead / adafruit_rfm9x compatible:
- *   modem: 915 MHz, BW 125 kHz, SF7, CR 4/5, preamble 8, sync 0x12, CRC on
- *   each packet carries a 4-byte header [to, from, id, flags]; we use the
- *   0xFF broadcast defaults, matching RH_RF95's plain send()/recv().
+ * Watch with:  arduino-app-cli monitor   (or the App Lab serial monitor).
  *
  * Wiring (RFM9x breakout -> UNO Q):
- *   VIN -> 3.3V   SCK  -> D13   CS  -> D10   RST -> D9
- *   GND -> GND    MISO -> D12   MOSI-> D11   G0  -> D2  (DIO0 / IRQ)
- * Attach the antenna before powering up.
+ *   VIN -> 3.3V   SCK  -> D13 (white)   CS   -> D10 (blue)
+ *   GND -> GND    MISO -> D12 (yellow)  G0   -> D8  (green)  DIO0 / IRQ
+ *                 MOSI -> D11 (orange)  RST  -> D2  (gray)
+ *   SCK/MISO/MOSI are fixed hardware-SPI pins; CS/DIO0/RST are software-set.
+ * Attach the antenna before powering up. VIN is 3.3V ONLY (not 5V).
  *
- * Library: install "RadioLib 7.7.0" by Jan Gromes via Library Manager.
- */ 
+ * Library: RadioLib 7.7.0 by Jan Gromes.
+ */
 
+#include <Arduino_RouterBridge.h>
 #include <RadioLib.h>
 
 // ---- choose this board's role ----
@@ -29,9 +28,9 @@
 #define NODE_ROLE      ROLE_SENDER   // this Arduino transmits; the Jetson receives
 
 // ---- pin map ----
-#define RFM95_CS   10
-#define RFM95_INT   2    // DIO0 / G0
-#define RFM95_RST   9
+#define RFM95_CS   10    // NSS  (blue,  D10)
+#define RFM95_INT   8    // DIO0 / G0 (green, D8)
+#define RFM95_RST   2    // RST  (gray,  D2)
 
 // ---- radio config ----
 #define RF95_FREQ  915.0
@@ -47,6 +46,26 @@ SX1276 radio = new Module(RFM95_CS, RFM95_INT, RFM95_RST, RADIOLIB_NC);
 
 uint16_t packetCount = 0;
 
+void blink(int times, int on_ms, int off_ms) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(LED_BUILTIN, HIGH); delay(on_ms);
+    digitalWrite(LED_BUILTIN, LOW);  delay(off_ms);
+  }
+}
+
+// Spin forever, re-reporting a fatal error so a late-attached monitor sees it.
+void die(const char *what, int code) {
+  while (1) {
+    Serial.print("FATAL: ");
+    Serial.print(what);
+    Serial.print(" (code ");
+    Serial.print(code);
+    Serial.println(") — check wiring/antenna, will keep reporting");
+    blink(3, 120, 120);     // 3 quick blinks = error heartbeat
+    delay(1500);
+  }
+}
+
 // Prepend the RadioHead header and transmit.
 int sendMessage(const char *msg) {
   size_t mlen = strlen(msg) + 1;            // include trailing NUL, like the original
@@ -59,8 +78,14 @@ int sendMessage(const char *msg) {
 }
 
 void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+
   Serial.begin(115200);
-  while (!Serial && millis() < 3000) { }
+  Bridge.begin();
+  Monitor.begin(115200);
+  // Give a monitor up to ~8 s to attach so the init banner isn't missed.
+  unsigned long t0 = millis();
+  while (!Monitor && millis() - t0 < 8000) { blink(1, 100, 100); }
 
   Serial.println();
   Serial.print("RFM9x link test (RadioLib), role: ");
@@ -69,9 +94,7 @@ void setup() {
   // begin(freq, bw, sf, cr, syncWord, power_dBm, preambleLength)
   int state = radio.begin(RF95_FREQ, 125.0, 7, 5, 0x12, TX_POWER, 8);
   if (state != RADIOLIB_ERR_NONE) {
-    Serial.print("ERROR: radio.begin() failed, code ");
-    Serial.println(state);
-    while (1) { delay(1000); }
+    die("radio.begin() failed", state);     // prints forever instead of dying silently
   }
   radio.setCRC(true);
   Serial.print("Radio init OK at ");
@@ -104,6 +127,7 @@ void loop() {
     Serial.print("Sending: ");
     Serial.println(msg);
     sendMessage(msg);
+    digitalWrite(LED_BUILTIN, HIGH); delay(20); digitalWrite(LED_BUILTIN, LOW);  // TX heartbeat
     lastSend = millis();
   }
 }
